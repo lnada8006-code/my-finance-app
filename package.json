@@ -1,0 +1,21 @@
+{
+  "name": "my-finance-app",
+  "version": "1.0.0",
+  "description": "Учёт объектов и долгов для ИП",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^13.2.0",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "express-session": "^1.19.0",
+    "passport": "^0.7.0",
+    "passport-yandex": "^1.0.0-beta.0"
+  }
+}
