@@ -6,6 +6,7 @@ const YandexStrategy = require('passport-yandex').Strategy;
 const db = require('./db');
 
 const app = express();
+app.use(express.static('.'));
 app.use(express.urlencoded({ extended: true }));
 
 app.use(session({
@@ -166,7 +167,10 @@ const COMMON_STYLES = `
 app.get('/', (req, res) => {
   if (!req.user) {
     return res.send(`
-      <!DOCTYPE html><html><head><meta charset="utf-8"><title>Вход</title>
+            <!DOCTYPE html><html><head><meta charset="utf-8">
+      <link rel="manifest" href="/manifest.json">
+      <meta name="theme-color" content="#FC3F1D">
+      <title>Вход</title>
       <style>${COMMON_STYLES}</style></head>
       <body style="display:flex; flex-direction:column; justify-content:center; min-height:90vh; text-align:center;">
         <div style="font-size:48px; margin-bottom:16px;">💼</div>
@@ -200,8 +204,12 @@ app.get('/', (req, res) => {
   });
 
   res.send(`
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Мои объекты</title></head>
+        <!DOCTYPE html>
+    <html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#FC3F1D">
+    <title>Мои объекты</title></head>
     <body>
       <style>${COMMON_STYLES}</style>
 
@@ -305,6 +313,22 @@ app.get('/', (req, res) => {
         }
         renderAccounts();
       </script>
+            <script>
+        const accountsData = ${JSON.stringify(accountsData)};
+        // ... весь твой скрипт для сортировки и поиска ...
+        renderAccounts();
+      </script>
+
+      <!-- НОВЫЙ СКРИПТ ДЛЯ PWA -->
+      <script>
+        if ('serviceWorker' in navigator) {
+          window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/sw.js')
+              .then(reg => console.log('Service Worker зарегистрирован:', reg.scope))
+              .catch(err => console.error('Ошибка регистрации Service Worker:', err));
+          });
+        }
+      </script>
     </body></html>
   `);
 });
@@ -344,8 +368,12 @@ app.get('/accounts/:id', (req, res) => {
         : `<span class="badge badge-success">Оплачено полностью ✓</span>`);
 
   res.send(`
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${account.name}</title></head>
+        <!DOCTYPE html>
+    <html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#FC3F1D">
+    <title>${account.name}</title></head>
     <body>
       <style>${COMMON_STYLES}</style>
 
@@ -441,8 +469,12 @@ app.get('/accounts/:id/edit', (req, res) => {
   ).join('');
 
   res.send(`
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Редактировать</title></head>
+        <!DOCTYPE html>
+    <html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#FC3F1D">
+    <title>Редактировать</title></head>
     <body>
       <style>${COMMON_STYLES}</style>
 
