@@ -529,7 +529,7 @@ app.get('/logout', (req, res) => {
   req.logout(() => res.redirect('/'));
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
