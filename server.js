@@ -19,7 +19,7 @@ app.use(passport.session());
 passport.use(new YandexStrategy({
     clientID: process.env.YANDEX_CLIENT_ID,
     clientSecret: process.env.YANDEX_CLIENT_SECRET,
-    callbackURL: 'http://localhost:3000/auth/callback'
+    callbackURL: process.env.YANDEX_CALLBACK_URL || 'http://localhost:3000/auth/callback'
   },
   function(accessToken, refreshToken, profile, done) {
     const yandexId = profile.id;
