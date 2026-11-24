@@ -1,5 +1,7 @@
 const Database = require('better-sqlite3');
-const db = new Database('finance.db');
+const path = require('path');
+const dbPath = path.join('/tmp', 'finance.db');
+const db = new Database(dbPath);
 
 // Создаём таблицу пользователей, если её ещё нет
 db.exec(`
