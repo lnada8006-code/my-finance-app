@@ -167,7 +167,7 @@ const COMMON_STYLES = `
 app.get('/', (req, res) => {
   if (!req.user) {
     return res.send(`
-            <!DOCTYPE html><html><head><meta charset="utf-8">
+      <!DOCTYPE html><html><head><meta charset="utf-8">
       <link rel="manifest" href="/manifest.json">
       <meta name="theme-color" content="#FC3F1D">
       <title>Вход</title>
@@ -204,7 +204,7 @@ app.get('/', (req, res) => {
   });
 
   res.send(`
-        <!DOCTYPE html>
+    <!DOCTYPE html>
     <html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="manifest" href="/manifest.json">
@@ -313,11 +313,6 @@ app.get('/', (req, res) => {
         }
         renderAccounts();
       </script>
-            <script>
-        const accountsData = ${JSON.stringify(accountsData)};
-        // ... весь твой скрипт для сортировки и поиска ...
-        renderAccounts();
-      </script>
 
       <!-- НОВЫЙ СКРИПТ ДЛЯ PWA -->
       <script>
@@ -368,7 +363,7 @@ app.get('/accounts/:id', (req, res) => {
         : `<span class="badge badge-success">Оплачено полностью ✓</span>`);
 
   res.send(`
-        <!DOCTYPE html>
+    <!DOCTYPE html>
     <html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="manifest" href="/manifest.json">
@@ -469,7 +464,7 @@ app.get('/accounts/:id/edit', (req, res) => {
   ).join('');
 
   res.send(`
-        <!DOCTYPE html>
+    <!DOCTYPE html>
     <html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="manifest" href="/manifest.json">
