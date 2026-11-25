@@ -340,9 +340,11 @@ app.get('/accounts/:id', (req, res) => {
     .all(account.id);
   const s = getAccountStats(account);
 
-  const txHtml = transactions.length
+    const txHtml = transactions.length
     ? transactions.map(x => {
-                return `
+        const c = x.amount >= 0 ? 'positive' : 'negative';
+        const sign = x.amount > 0 ? '+' : '';
+        return `
           <div class="row" style="padding:12px 0; border-bottom:1px solid var(--border);">
             <div>
               <div style="font-size:14px;">${x.description || 'Без описания'}</div>
