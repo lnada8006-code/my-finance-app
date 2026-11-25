@@ -342,15 +342,18 @@ app.get('/accounts/:id', (req, res) => {
 
   const txHtml = transactions.length
     ? transactions.map(x => {
-        const c = x.amount >= 0 ? 'positive' : 'negative';
-        const sign = x.amount > 0 ? '+' : '';
-        return `
+                return `
           <div class="row" style="padding:12px 0; border-bottom:1px solid var(--border);">
             <div>
               <div style="font-size:14px;">${x.description || 'Без описания'}</div>
               <div class="muted" style="font-size:12px;">${x.category || 'без категории'} • ${x.date}</div>
             </div>
-            <div class="money ${c}">${sign}${x.amount.toLocaleString('ru-RU')} ₽</div>
+            <div style="display:flex; align-items:center; gap:10px;">
+              <div class="money ${c}">${sign}${x.amount.toLocaleString('ru-RU')} ₽</div>
+              <form method="POST" action="/accounts/${account.id}/transactions/${x.id}/delete" style="margin:0;" onsubmit="return confirm('Удалить операцию?');">
+                <button type="submit" style="background:none; border:none; color:var(--danger); font-size:18px; cursor:pointer; padding:4px;" title="Удалить">✕</button>
+              </form>
+            </div>
           </div>
         `;
       }).join('')
@@ -488,6 +491,15 @@ app.get('/accounts/:id/edit', (req, res) => {
 
         <button type="submit" style="margin-top:8px;">Сохранить</button>
       </form>
+
+      <hr style="margin:30px 0; border:none; border-top:1px solid var(--border);">
+
+      <form method="POST" action="/accounts/${account.id}/delete" onsubmit="return confirm('Удалить объект и все его операции? Это действие нельзя отменить.');">
+        <button type="submit" style="background:none; border:1px solid var(--danger); color:var(--danger); padding:12px; border-radius:12px; width:100%; cursor:pointer; font-size:15px;">
+          Удалить объект
+        </button>
+      </form>    
+      </form>
     </body></html>
   `);
 });
@@ -510,7 +522,20 @@ app.post('/accounts/:id/edit', (req, res) => {
 
   res.redirect('/accounts/' + account.id);
 });
+// ===== УДАЛЕНИЕ ОБЪЕКТА =====
+app.post('/accounts/:id/delete', (req, res) => {
+  if (!req.user) return res.redirect('/');
 
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
+    .get(req.params.id, req.user.id);
+  if (!account) return res.status(404).send('Объект не найден');
+
+  // Сначала удаляем все операции этого объекта, потом сам объект
+  db.prepare('DELETE FROM transactions WHERE account_id = ?').run(account.id);
+  db.prepare('DELETE FROM accounts WHERE id = ?').run(account.id);
+
+  res.redirect('/');
+});
 // ===== ДОБАВЛЕНИЕ ОПЕРАЦИИ =====
 app.post('/accounts/:id/transactions', (req, res) => {
   if (!req.user) return res.redirect('/');
@@ -533,7 +558,20 @@ app.post('/accounts/:id/transactions', (req, res) => {
 
   res.redirect('/accounts/' + account.id);
 });
+// ===== УДАЛЕНИЕ ОПЕРАЦИИ =====
+app.post('/accounts/:accountId/transactions/:txId/delete', (req, res) => {
+  if (!req.user) return res.redirect('/');
 
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
+    .get(req.params.accountId, req.user.id);
+  if (!account) return res.status(404).send('Объект не найден');
+
+  // Удаляем только если операция принадлежит этому объекту
+  db.prepare('DELETE FROM transactions WHERE id = ? AND account_id = ?')
+    .run(req.params.txId, account.id);
+
+  res.redirect('/accounts/' + account.id);
+});
 // ===== СОЗДАНИЕ ОБЪЕКТА =====
 app.post('/accounts', (req, res) => {
   if (!req.user) return res.redirect('/');
