@@ -481,6 +481,7 @@ app.get('/accounts/:id/edit', (req, res) => {
       <a href="/accounts/${account.id}">← Назад к объекту</a>
       <h2 style="margin-top:16px;">Редактировать объект</h2>
 
+      <!-- ФОРМА СОХРАНЕНИЯ -->
       <form method="POST" action="/accounts/${account.id}/edit" class="form-col" style="margin-top:16px;">
         <label class="muted" style="font-size:13px;">Название</label>
         <input name="name" value="${account.name.replace(/"/g, '&quot;')}" required>
@@ -494,13 +495,13 @@ app.get('/accounts/:id/edit', (req, res) => {
         <button type="submit" style="margin-top:8px;">Сохранить</button>
       </form>
 
+      <!-- БЛОК УДАЛЕНИЯ (отдельная форма) -->
       <hr style="margin:30px 0; border:none; border-top:1px solid var(--border);">
 
       <form method="POST" action="/accounts/${account.id}/delete" onsubmit="return confirm('Удалить объект и все его операции? Это действие нельзя отменить.');">
         <button type="submit" style="background:none; border:1px solid var(--danger); color:var(--danger); padding:12px; border-radius:12px; width:100%; cursor:pointer; font-size:15px;">
           Удалить объект
         </button>
-      </form>    
       </form>
     </body></html>
   `);
