@@ -3,7 +3,7 @@ const express = require('express');
 const session = require('express-session');
 const passport = require('passport');
 const YandexStrategy = require('passport-yandex').Strategy;
-const db = require('./db');
+const pool = require('./db'); // Теперь это PostgreSQL pool
 
 const app = express();
 app.use(express.static('.'));
@@ -17,39 +17,66 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
+// ===== СТРАТЕГИЯ АВТОРИЗАЦИИ =====
 passport.use(new YandexStrategy({
     clientID: process.env.YANDEX_CLIENT_ID,
     clientSecret: process.env.YANDEX_CLIENT_SECRET,
     callbackURL: process.env.YANDEX_CALLBACK_URL || 'http://localhost:3000/auth/callback'
   },
-  function(accessToken, refreshToken, profile, done) {
-    const yandexId = profile.id;
-    const displayName = profile.displayName || profile.username || 'Друг';
-    const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
+  async function(accessToken, refreshToken, profile, done) {
+    try {
+      const yandexId = profile.id;
+      const displayName = profile.displayName || profile.username || 'Друг';
+      const email = profile.emails && profile.emails[0] ? profile.emails[0].value : null;
 
-    let user = db.prepare('SELECT * FROM users WHERE yandex_id = ?').get(yandexId);
-    if (user) {
-      db.prepare('UPDATE users SET display_name = ?, email = ? WHERE yandex_id = ?')
-        .run(displayName, email, yandexId);
-      user = db.prepare('SELECT * FROM users WHERE yandex_id = ?').get(yandexId);
-    } else {
-      const info = db.prepare('INSERT INTO users (yandex_id, display_name, email) VALUES (?, ?, ?)')
-        .run(yandexId, displayName, email);
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+      // Ищем пользователя
+      let result = await pool.query('SELECT * FROM users WHERE yandex_id = $1', [yandexId]);
+      let user = result.rows[0];
+
+      if (user) {
+        // Обновляем данные
+        await pool.query('UPDATE users SET display_name = $1, email = $2 WHERE yandex_id = $3',
+          [displayName, email, yandexId]);
+        result = await pool.query('SELECT * FROM users WHERE yandex_id = $1', [yandexId]);
+        user = result.rows[0];
+      } else {
+        // Создаём нового
+        result = await pool.query(
+          'INSERT INTO users (yandex_id, display_name, email) VALUES ($1, $2, $3) RETURNING *',
+          [yandexId, displayName, email]
+        );
+        user = result.rows[0];
+      }
+      return done(null, user);
+    } catch (err) {
+      return done(err);
     }
-    return done(null, user);
   }
 ));
 
 passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser((id, done) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-  done(null, user);
+passport.deserializeUser(async (id, done) => {
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    done(null, result.rows[0]);
+  } catch (err) {
+    done(err);
+  }
 });
 
-function getAccountStats(account) {
-  const paid = db.prepare("SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE account_id = ? AND amount > 0").get(account.id).s;
-  const expense = db.prepare("SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE account_id = ? AND amount < 0").get(account.id).s;
+// ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+async function getAccountStats(account) {
+  const paidResult = await pool.query(
+    'SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE account_id = $1 AND amount > 0',
+    [account.id]
+  );
+  const expenseResult = await pool.query(
+    'SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE account_id = $1 AND amount < 0',
+    [account.id]
+  );
+
+  const paid = parseFloat(paidResult.rows[0].s);
+  const expense = parseFloat(expenseResult.rows[0].s);
   const expenseAbs = Math.abs(expense);
   const contract = account.contract_amount || 0;
   const debt = contract - paid;
@@ -58,7 +85,6 @@ function getAccountStats(account) {
   return { contract, paid, expense: expenseAbs, debt, profit, projectedProfit };
 }
 
-// Иконка по типу объекта
 function typeIcon(type) {
   const map = {
     'заказ': '🏗️',
@@ -70,7 +96,6 @@ function typeIcon(type) {
   return map[type] || '📁';
 }
 
-// Общие CSS-стили для всех страниц
 const COMMON_STYLES = `
   :root {
     --primary: #FC3F1D;
@@ -164,7 +189,7 @@ const COMMON_STYLES = `
 `;
 
 // ===== ГЛАВНАЯ =====
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
   if (!req.user) {
     return res.send(`
       <!DOCTYPE html><html><head><meta charset="utf-8">
@@ -183,407 +208,482 @@ app.get('/', (req, res) => {
     `);
   }
 
-  const accounts = db.prepare('SELECT * FROM accounts WHERE user_id = ? ORDER BY id DESC').all(req.user.id);
-  let totalDebt = 0, totalPaid = 0, totalContract = 0;
+  try {
+    const accountsResult = await pool.query(
+      'SELECT * FROM accounts WHERE user_id = $1 ORDER BY id DESC',
+      [req.user.id]
+    );
+    const accounts = accountsResult.rows;
 
-  const accountsData = accounts.map(a => {
-    const s = getAccountStats(a);
-    totalDebt += s.debt > 0 ? s.debt : 0;
-    totalPaid += s.paid;
-    totalContract += s.contract;
-    return {
-      id: a.id,
-      name: a.name,
-      type: a.type || 'другое',
-      contract: s.contract,
-      paid: s.paid,
-      expense: s.expense,
-      debt: s.debt,
-      icon: typeIcon(a.type)
-    };
-  });
+    let totalDebt = 0, totalPaid = 0, totalContract = 0;
+    const accountsData = [];
 
-  res.send(`
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#FC3F1D">
-    <title>Мои объекты</title></head>
-    <body>
-      <style>${COMMON_STYLES}</style>
+    for (const a of accounts) {
+      const s = await getAccountStats(a);
+      totalDebt += s.debt > 0 ? s.debt : 0;
+      totalPaid += s.paid;
+      totalContract += s.contract;
+      accountsData.push({
+        id: a.id,
+        name: a.name,
+        type: a.type || 'другое',
+        contract: s.contract,
+        paid: s.paid,
+        expense: s.expense,
+        debt: s.debt,
+        icon: typeIcon(a.type)
+      });
+    }
 
-      <div class="row" style="margin-bottom:20px;">
-        <div class="row" style="gap:12px;">
-          <div style="width:42px; height:42px; border-radius:50%; background:var(--primary); color:white; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px;">
-            ${(req.user.display_name || 'Д').charAt(0).toUpperCase()}
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="manifest" href="/manifest.json">
+      <meta name="theme-color" content="#FC3F1D">
+      <title>Мои объекты</title></head>
+      <body>
+        <style>${COMMON_STYLES}</style>
+
+        <div class="row" style="margin-bottom:20px;">
+          <div class="row" style="gap:12px;">
+            <div style="width:42px; height:42px; border-radius:50%; background:var(--primary); color:white; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px;">
+              ${(req.user.display_name || 'Д').charAt(0).toUpperCase()}
+            </div>
+            <div>
+              <div style="font-weight:600;">${req.user.display_name}</div>
+              <div class="muted" style="font-size:12px;">${req.user.email || ''}</div>
+            </div>
           </div>
-          <div>
-            <div style="font-weight:600;">${req.user.display_name}</div>
-            <div class="muted" style="font-size:12px;">${req.user.email || ''}</div>
+          <a href="/logout" class="muted" style="font-size:14px;">Выйти</a>
+        </div>
+
+        <div style="background:linear-gradient(135deg,#FC3F1D,#ff6b4a); color:white; border-radius:20px; padding:24px; margin-bottom:20px; box-shadow:0 8px 20px rgba(252,63,29,0.25);">
+          <div style="font-size:14px; opacity:0.9;">Должны мне по всем объектам</div>
+          <div style="font-size:34px; font-weight:800; margin:4px 0;">${totalDebt.toLocaleString('ru-RU')} ₽</div>
+          <div style="font-size:13px; opacity:0.9;">
+            По договорам: ${totalContract.toLocaleString('ru-RU')} ₽ • Оплачено: ${totalPaid.toLocaleString('ru-RU')} ₽
           </div>
         </div>
-        <a href="/logout" class="muted" style="font-size:14px;">Выйти</a>
-      </div>
 
-      <div style="background:linear-gradient(135deg,#FC3F1D,#ff6b4a); color:white; border-radius:20px; padding:24px; margin-bottom:20px; box-shadow:0 8px 20px rgba(252,63,29,0.25);">
-        <div style="font-size:14px; opacity:0.9;">Должны мне по всем объектам</div>
-        <div style="font-size:34px; font-weight:800; margin:4px 0;">${totalDebt.toLocaleString('ru-RU')} ₽</div>
-        <div style="font-size:13px; opacity:0.9;">
-          По договорам: ${totalContract.toLocaleString('ru-RU')} ₽ • Оплачено: ${totalPaid.toLocaleString('ru-RU')} ₽
+        <h3>Мои объекты</h3>
+
+        <div class="card" style="margin-bottom:14px; display:flex; flex-direction:column; gap:8px;">
+          <input id="searchInput" placeholder="🔍 Поиск по названию..." oninput="renderAccounts()">
+          <div style="display:flex; gap:8px; align-items:center;">
+            <select id="sortSelect" onchange="renderAccounts()" style="flex:1;">
+              <option value="debt">По долгу (большие сверху)</option>
+              <option value="date">По дате (новые сверху)</option>
+              <option value="name">По названию (А–Я)</option>
+            </select>
+            <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); white-space:nowrap;">
+              <input type="checkbox" id="hidePaidCheck" onchange="renderAccounts()" style="width:auto;"> Скрыть оплаченные
+            </label>
+          </div>
         </div>
-      </div>
 
-      <h3>Мои объекты</h3>
+        <div id="accountsList"></div>
 
-      <div class="card" style="margin-bottom:14px; display:flex; flex-direction:column; gap:8px;">
-        <input id="searchInput" placeholder="🔍 Поиск по названию..." oninput="renderAccounts()">
-        <div style="display:flex; gap:8px; align-items:center;">
-          <select id="sortSelect" onchange="renderAccounts()" style="flex:1;">
-            <option value="debt">По долгу (большие сверху)</option>
-            <option value="date">По дате (новые сверху)</option>
-            <option value="name">По названию (А–Я)</option>
+        <h3 style="margin-top:32px;">Создать объект</h3>
+        <form method="POST" action="/accounts" class="form-col">
+          <input name="name" placeholder="Название (например, Владимировка)" required>
+          <select name="type">
+            <option value="заказ">🏗️ Заказ / подряд</option>
+            <option value="недвижимость">🏠 Недвижимость</option>
+            <option value="транспорт">🚗 Транспорт</option>
+            <option value="оборудование">📦 Оборудование</option>
+            <option value="другое">📁 Другое</option>
           </select>
-          <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); white-space:nowrap;">
-            <input type="checkbox" id="hidePaidCheck" onchange="renderAccounts()" style="width:auto;"> Скрыть оплаченные
-          </label>
-        </div>
-      </div>
+          <input name="contract_amount" type="number" step="0.01" min="0" placeholder="Сумма договора, ₽">
+          <button type="submit">Создать</button>
+        </form>
 
-      <div id="accountsList"></div>
+        <script>
+          const accountsData = ${JSON.stringify(accountsData)};
+          function formatMoney(n) { return n.toLocaleString('ru-RU') + ' ₽'; }
 
-      <h3 style="margin-top:32px;">Создать объект</h3>
-      <form method="POST" action="/accounts" class="form-col">
-        <input name="name" placeholder="Название (например, Владимировка)" required>
-        <select name="type">
-          <option value="заказ">🏗️ Заказ / подряд</option>
-          <option value="недвижимость">🏠 Недвижимость</option>
-          <option value="транспорт">🚗 Транспорт</option>
-          <option value="оборудование">📦 Оборудование</option>
-          <option value="другое">📁 Другое</option>
-        </select>
-        <input name="contract_amount" type="number" step="0.01" min="0" placeholder="Сумма договора, ₽">
-        <button type="submit">Создать</button>
-      </form>
+          function renderAccounts() {
+            const search = document.getElementById('searchInput').value.toLowerCase().trim();
+            const sort = document.getElementById('sortSelect').value;
+            const hidePaid = document.getElementById('hidePaidCheck').checked;
 
-      <script>
-        const accountsData = ${JSON.stringify(accountsData)};
-        function formatMoney(n) { return n.toLocaleString('ru-RU') + ' ₽'; }
+            let list = accountsData.slice();
+            if (search) list = list.filter(a => a.name.toLowerCase().includes(search));
+            if (hidePaid) list = list.filter(a => a.debt > 0);
+            if (sort === 'debt') list.sort((a, b) => b.debt - a.debt);
+            else if (sort === 'name') list.sort((a, b) => a.name.localeCompare(b.name, 'ru'));
 
-        function renderAccounts() {
-          const search = document.getElementById('searchInput').value.toLowerCase().trim();
-          const sort = document.getElementById('sortSelect').value;
-          const hidePaid = document.getElementById('hidePaidCheck').checked;
+            const container = document.getElementById('accountsList');
+            if (list.length === 0) {
+              container.innerHTML = '<div class="card" style="text-align:center; color:var(--muted);">Ничего не найдено</div>';
+              return;
+            }
 
-          let list = accountsData.slice();
-          if (search) list = list.filter(a => a.name.toLowerCase().includes(search));
-          if (hidePaid) list = list.filter(a => a.debt > 0);
-          if (sort === 'debt') list.sort((a, b) => b.debt - a.debt);
-          else if (sort === 'name') list.sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+            container.innerHTML = list.map(a => {
+              const badge = a.debt > 0
+                ? '<span class="badge badge-danger">Долг: ' + formatMoney(a.debt) + '</span>'
+                : (a.debt < 0
+                    ? '<span class="badge badge-success">Переплата: ' + formatMoney(Math.abs(a.debt)) + '</span>'
+                    : '<span class="badge badge-success">Оплачено ✓</span>');
 
-          const container = document.getElementById('accountsList');
-          if (list.length === 0) {
-            container.innerHTML = '<div class="card" style="text-align:center; color:var(--muted);">Ничего не найдено</div>';
-            return;
-          }
-
-          container.innerHTML = list.map(a => {
-            const badge = a.debt > 0
-              ? '<span class="badge badge-danger">Долг: ' + formatMoney(a.debt) + '</span>'
-              : (a.debt < 0
-                  ? '<span class="badge badge-success">Переплата: ' + formatMoney(Math.abs(a.debt)) + '</span>'
-                  : '<span class="badge badge-success">Оплачено ✓</span>');
-
-            return '<a href="/accounts/' + a.id + '" class="card-link">' +
-              '<div class="row" style="gap:12px; align-items:flex-start;">' +
-                '<div class="row" style="gap:12px; align-items:center; flex:1; min-width:0;">' +
-                  '<div class="icon-circle">' + a.icon + '</div>' +
-                  '<div style="min-width:0;">' +
-                    '<div style="font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + a.name + '</div>' +
-                    '<div class="muted" style="font-size:12px;">' + a.type + '</div>' +
+              return '<a href="/accounts/' + a.id + '" class="card-link">' +
+                '<div class="row" style="gap:12px; align-items:flex-start;">' +
+                  '<div class="row" style="gap:12px; align-items:center; flex:1; min-width:0;">' +
+                    '<div class="icon-circle">' + a.icon + '</div>' +
+                    '<div style="min-width:0;">' +
+                      '<div style="font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + a.name + '</div>' +
+                      '<div class="muted" style="font-size:12px;">' + a.type + '</div>' +
+                    '</div>' +
                   '</div>' +
+                  '<div style="text-align:right; flex-shrink:0;">' + badge + '</div>' +
                 '</div>' +
-                '<div style="text-align:right; flex-shrink:0;">' + badge + '</div>' +
-              '</div>' +
-              '<div class="muted" style="font-size:12px; margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">' +
-                'Договор: ' + formatMoney(a.contract) + ' • Оплачено: ' + formatMoney(a.paid) + ' • Расходы: ' + formatMoney(a.expense) +
-              '</div>' +
-            '</a>';
-          }).join('');
-        }
-        renderAccounts();
-      </script>
+                '<div class="muted" style="font-size:12px; margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">' +
+                  'Договор: ' + formatMoney(a.contract) + ' • Оплачено: ' + formatMoney(a.paid) + ' • Расходы: ' + formatMoney(a.expense) +
+                '</div>' +
+              '</a>';
+            }).join('');
+          }
+          renderAccounts();
+        </script>
 
-      <!-- НОВЫЙ СКРИПТ ДЛЯ PWA -->
-      <script>
-        if ('serviceWorker' in navigator) {
-          window.addEventListener('load', () => {
-            navigator.serviceWorker.register('/sw.js')
-              .then(reg => console.log('Service Worker зарегистрирован:', reg.scope))
-              .catch(err => console.error('Ошибка регистрации Service Worker:', err));
-          });
-        }
-      </script>
-    </body></html>
-  `);
+        <script>
+          if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+              navigator.serviceWorker.register('/sw.js')
+                .then(reg => console.log('Service Worker зарегистрирован:', reg.scope))
+                .catch(err => console.error('Ошибка регистрации Service Worker:', err));
+            });
+          }
+        </script>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка загрузки объектов');
+  }
 });
 
 // ===== СТРАНИЦА ОБЪЕКТА =====
-app.get('/accounts/:id', (req, res) => {
+app.get('/accounts/:id', async (req, res) => {
   if (!req.user) return res.redirect('/');
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.user.id);
-  if (!account) return res.status(404).send('Объект не найден');
+  try {
+    const accountResult = await pool.query(
+      'SELECT * FROM accounts WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).send('Объект не найден');
 
-  const transactions = db.prepare('SELECT * FROM transactions WHERE account_id = ? ORDER BY date DESC, id DESC')
-    .all(account.id);
-  const s = getAccountStats(account);
+    const txResult = await pool.query(
+      'SELECT * FROM transactions WHERE account_id = $1 ORDER BY date DESC, id DESC',
+      [account.id]
+    );
+    const transactions = txResult.rows;
+    const s = await getAccountStats(account);
 
     const txHtml = transactions.length
-    ? transactions.map(x => {
-        const c = x.amount >= 0 ? 'positive' : 'negative';
-        const sign = x.amount > 0 ? '+' : '';
-        return `
-          <div class="row" style="padding:12px 0; border-bottom:1px solid var(--border);">
-            <div>
-              <div style="font-size:14px;">${x.description || 'Без описания'}</div>
-              <div class="muted" style="font-size:12px;">${x.category || 'без категории'} • ${x.date}</div>
+      ? transactions.map(x => {
+          const c = x.amount >= 0 ? 'positive' : 'negative';
+          const sign = x.amount > 0 ? '+' : '';
+          return `
+            <div class="row" style="padding:12px 0; border-bottom:1px solid var(--border);">
+              <div>
+                <div style="font-size:14px;">${x.description || 'Без описания'}</div>
+                <div class="muted" style="font-size:12px;">${x.category || 'без категории'} • ${x.date}</div>
+              </div>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <div class="money ${c}">${sign}${parseFloat(x.amount).toLocaleString('ru-RU')} ₽</div>
+                <form method="POST" action="/accounts/${account.id}/transactions/${x.id}/delete" style="margin:0;" onsubmit="return confirm('Удалить операцию?');">
+                  <button type="submit" style="background:none; border:none; color:var(--danger); font-size:18px; cursor:pointer; padding:4px;" title="Удалить">✕</button>
+                </form>
+              </div>
             </div>
-            <div style="display:flex; align-items:center; gap:10px;">
-              <div class="money ${c}">${sign}${x.amount.toLocaleString('ru-RU')} ₽</div>
-              <form method="POST" action="/accounts/${account.id}/transactions/${x.id}/delete" style="margin:0;" onsubmit="return confirm('Удалить операцию?');">
-                <button type="submit" style="background:none; border:none; color:var(--danger); font-size:18px; cursor:pointer; padding:4px;" title="Удалить">✕</button>
-              </form>
-            </div>
+          `;
+        }).join('')
+      : '<div class="muted" style="text-align:center; padding:20px 0;">Операций пока нет</div>';
+
+    const debtBadge = s.debt > 0
+      ? `<span class="badge badge-danger">Долг: ${s.debt.toLocaleString('ru-RU')} ₽</span>`
+      : (s.debt < 0
+          ? `<span class="badge badge-success">Переплата: ${Math.abs(s.debt).toLocaleString('ru-RU')} ₽</span>`
+          : `<span class="badge badge-success">Оплачено полностью ✓</span>`);
+
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="manifest" href="/manifest.json">
+      <meta name="theme-color" content="#FC3F1D">
+      <title>${account.name}</title></head>
+      <body>
+        <style>${COMMON_STYLES}</style>
+
+        <div class="row" style="margin-bottom:16px;">
+          <a href="/">← Назад</a>
+          <a href="/accounts/${account.id}/edit" style="font-size:14px;">Редактировать</a>
+        </div>
+
+        <div class="row" style="gap:12px; align-items:center; margin-bottom:20px;">
+          <div class="icon-circle" style="width:52px; height:52px; font-size:26px;">${typeIcon(account.type)}</div>
+          <div>
+            <h2>${account.name}</h2>
+            <div class="muted">${account.type || 'без типа'}</div>
           </div>
-        `;
-      }).join('')
-    : '<div class="muted" style="text-align:center; padding:20px 0;">Операций пока нет</div>';
-
-  const debtBadge = s.debt > 0
-    ? `<span class="badge badge-danger">Долг: ${s.debt.toLocaleString('ru-RU')} ₽</span>`
-    : (s.debt < 0
-        ? `<span class="badge badge-success">Переплата: ${Math.abs(s.debt).toLocaleString('ru-RU')} ₽</span>`
-        : `<span class="badge badge-success">Оплачено полностью ✓</span>`);
-
-  res.send(`
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#FC3F1D">
-    <title>${account.name}</title></head>
-    <body>
-      <style>${COMMON_STYLES}</style>
-
-      <div class="row" style="margin-bottom:16px;">
-        <a href="/">← Назад</a>
-        <a href="/accounts/${account.id}/edit" style="font-size:14px;">Редактировать</a>
-      </div>
-
-      <div class="row" style="gap:12px; align-items:center; margin-bottom:20px;">
-        <div class="icon-circle" style="width:52px; height:52px; font-size:26px;">${typeIcon(account.type)}</div>
-        <div>
-          <h2>${account.name}</h2>
-          <div class="muted">${account.type || 'без типа'}</div>
         </div>
-      </div>
 
-      <div class="card" style="margin-bottom:14px;">
-        <div class="muted" style="font-size:13px; margin-bottom:6px;">Долг заказчика</div>
-        <div style="margin-bottom:14px;">${debtBadge}</div>
-        <div class="row" style="padding-top:12px; border-top:1px solid var(--border); font-size:14px;">
-          <span class="muted">Договор</span><span class="money">${s.contract.toLocaleString('ru-RU')} ₽</span>
+        <div class="card" style="margin-bottom:14px;">
+          <div class="muted" style="font-size:13px; margin-bottom:6px;">Долг заказчика</div>
+          <div style="margin-bottom:14px;">${debtBadge}</div>
+          <div class="row" style="padding-top:12px; border-top:1px solid var(--border); font-size:14px;">
+            <span class="muted">Договор</span><span class="money">${s.contract.toLocaleString('ru-RU')} ₽</span>
+          </div>
+          <div class="row" style="margin-top:8px; font-size:14px;">
+            <span class="muted">Оплачено</span><span class="money positive">${s.paid.toLocaleString('ru-RU')} ₽</span>
+          </div>
         </div>
-        <div class="row" style="margin-top:8px; font-size:14px;">
-          <span class="muted">Оплачено</span><span class="money positive">${s.paid.toLocaleString('ru-RU')} ₽</span>
-        </div>
-      </div>
 
-      <div class="card" style="margin-bottom:20px;">
-        <div class="row" style="font-size:14px;">
-          <span class="muted">Расходы</span><span class="money negative">${s.expense.toLocaleString('ru-RU')} ₽</span>
+        <div class="card" style="margin-bottom:20px;">
+          <div class="row" style="font-size:14px;">
+            <span class="muted">Расходы</span><span class="money negative">${s.expense.toLocaleString('ru-RU')} ₽</span>
+          </div>
+          <div class="row" style="margin-top:8px; font-size:14px;">
+            <span class="muted">Прибыль в кассе</span>
+            <span class="money ${s.profit >= 0 ? 'positive' : 'negative'}">${s.profit.toLocaleString('ru-RU')} ₽</span>
+          </div>
+          <div class="row" style="margin-top:8px; font-size:14px;">
+            <span class="muted">Если всё оплатят</span>
+            <span class="money ${s.projectedProfit >= 0 ? 'positive' : 'negative'}">${s.projectedProfit.toLocaleString('ru-RU')} ₽</span>
+          </div>
         </div>
-        <div class="row" style="margin-top:8px; font-size:14px;">
-          <span class="muted">Прибыль в кассе</span>
-          <span class="money ${s.profit >= 0 ? 'positive' : 'negative'}">${s.profit.toLocaleString('ru-RU')} ₽</span>
-        </div>
-        <div class="row" style="margin-top:8px; font-size:14px;">
-          <span class="muted">Если всё оплатят</span>
-          <span class="money ${s.projectedProfit >= 0 ? 'positive' : 'negative'}">${s.projectedProfit.toLocaleString('ru-RU')} ₽</span>
-        </div>
-      </div>
 
-      <h3>Операции</h3>
-      <div class="card" style="margin-bottom:20px;">${txHtml}</div>
+        <h3>Операции</h3>
+        <div class="card" style="margin-bottom:20px;">${txHtml}</div>
 
-      <h3>Добавить операцию</h3>
-      <form method="POST" action="/accounts/${account.id}/transactions" class="form-col">
-        <select name="kind" onchange="updateCategories(this.value)">
-          <option value="income">💰 Доход (поступление от заказчика)</option>
-          <option value="expense">💸 Расход (трата)</option>
-        </select>
-        <select name="category" id="categorySelect">
-          <option value="Задаток">Задаток</option>
-          <option value="Оплата от заказчика">Оплата от заказчика</option>
-          <option value="Прочее поступление">Прочее поступление</option>
-        </select>
-        <input name="amount" type="number" step="0.01" min="0" placeholder="Сумма, ₽" required>
-        <input name="description" placeholder="Описание (необязательно)">
-        <input name="date" type="date">
-        <button type="submit">Добавить</button>
-      </form>
+        <h3>Добавить операцию</h3>
+        <form method="POST" action="/accounts/${account.id}/transactions" class="form-col">
+          <select name="kind" onchange="updateCategories(this.value)">
+            <option value="income">💰 Доход (поступление от заказчика)</option>
+            <option value="expense">💸 Расход (трата)</option>
+          </select>
+          <select name="category" id="categorySelect">
+            <option value="Задаток">Задаток</option>
+            <option value="Оплата от заказчика">Оплата от заказчика</option>
+            <option value="Прочее поступление">Прочее поступление</option>
+          </select>
+          <input name="amount" type="number" step="0.01" min="0" placeholder="Сумма, ₽" required>
+          <input name="description" placeholder="Описание (необязательно)">
+          <input name="date" type="date">
+          <button type="submit">Добавить</button>
+        </form>
 
-      <script>
-        const categories = {
-          income: ['Задаток', 'Оплата от заказчика', 'Прочее поступление'],
-          expense: ['Зарплата работникам', 'Закупка материалов', 'Закупка оборудования', 'Налоги', 'Прочие расходы']
-        };
-        function updateCategories(kind) {
-          const sel = document.getElementById('categorySelect');
-          sel.innerHTML = categories[kind].map(c => '<option value="' + c + '">' + c + '</option>').join('');
-        }
-      </script>
-    </body></html>
-  `);
+        <script>
+          const categories = {
+            income: ['Задаток', 'Оплата от заказчика', 'Прочее поступление'],
+            expense: ['Зарплата работникам', 'Закупка материалов', 'Закупка оборудования', 'Налоги', 'Прочие расходы']
+          };
+          function updateCategories(kind) {
+            const sel = document.getElementById('categorySelect');
+            sel.innerHTML = categories[kind].map(c => '<option value="' + c + '">' + c + '</option>').join('');
+          }
+        </script>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка загрузки объекта');
+  }
 });
 
 // ===== РЕДАКТИРОВАНИЕ ОБЪЕКТА (форма) =====
-app.get('/accounts/:id/edit', (req, res) => {
+app.get('/accounts/:id/edit', async (req, res) => {
   if (!req.user) return res.redirect('/');
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.user.id);
-  if (!account) return res.status(404).send('Объект не найден');
+  try {
+    const accountResult = await pool.query(
+      'SELECT * FROM accounts WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).send('Объект не найден');
 
-  const types = [
-    ['заказ', '🏗️ Заказ / подряд'],
-    ['недвижимость', '🏠 Недвижимость'],
-    ['транспорт', '🚗 Транспорт'],
-    ['оборудование', '📦 Оборудование'],
-    ['другое', '📁 Другое']
-  ];
-  const typeOptions = types.map(([v, label]) =>
-    `<option value="${v}" ${account.type === v ? 'selected' : ''}>${label}</option>`
-  ).join('');
+    const types = [
+      ['заказ', '🏗️ Заказ / подряд'],
+      ['недвижимость', '🏠 Недвижимость'],
+      ['транспорт', '🚗 Транспорт'],
+      ['оборудование', '📦 Оборудование'],
+      ['другое', '📁 Другое']
+    ];
+    const typeOptions = types.map(([v, label]) =>
+      `<option value="${v}" ${account.type === v ? 'selected' : ''}>${label}</option>`
+    ).join('');
 
-  res.send(`
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#FC3F1D">
-    <title>Редактировать</title></head>
-    <body>
-      <style>${COMMON_STYLES}</style>
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="manifest" href="/manifest.json">
+      <meta name="theme-color" content="#FC3F1D">
+      <title>Редактировать</title></head>
+      <body>
+        <style>${COMMON_STYLES}</style>
 
-      <a href="/accounts/${account.id}">← Назад к объекту</a>
-      <h2 style="margin-top:16px;">Редактировать объект</h2>
+        <a href="/accounts/${account.id}">← Назад к объекту</a>
+        <h2 style="margin-top:16px;">Редактировать объект</h2>
 
-      <!-- ФОРМА СОХРАНЕНИЯ -->
-      <form method="POST" action="/accounts/${account.id}/edit" class="form-col" style="margin-top:16px;">
-        <label class="muted" style="font-size:13px;">Название</label>
-        <input name="name" value="${account.name.replace(/"/g, '&quot;')}" required>
+        <form method="POST" action="/accounts/${account.id}/edit" class="form-col" style="margin-top:16px;">
+          <label class="muted" style="font-size:13px;">Название</label>
+          <input name="name" value="${account.name.replace(/"/g, '&quot;')}" required>
 
-        <label class="muted" style="font-size:13px;">Тип</label>
-        <select name="type">${typeOptions}</select>
+          <label class="muted" style="font-size:13px;">Тип</label>
+          <select name="type">${typeOptions}</select>
 
-        <label class="muted" style="font-size:13px;">Сумма договора, ₽</label>
-        <input name="contract_amount" type="number" step="0.01" min="0" value="${account.contract_amount || 0}">
+          <label class="muted" style="font-size:13px;">Сумма договора, ₽</label>
+          <input name="contract_amount" type="number" step="0.01" min="0" value="${account.contract_amount || 0}">
 
-        <button type="submit" style="margin-top:8px;">Сохранить</button>
-      </form>
+          <button type="submit" style="margin-top:8px;">Сохранить</button>
+        </form>
 
-      <!-- БЛОК УДАЛЕНИЯ (отдельная форма) -->
-      <hr style="margin:30px 0; border:none; border-top:1px solid var(--border);">
+        <hr style="margin:30px 0; border:none; border-top:1px solid var(--border);">
 
-      <form method="POST" action="/accounts/${account.id}/delete" onsubmit="return confirm('Удалить объект и все его операции? Это действие нельзя отменить.');">
-        <button type="submit" style="background:none; border:1px solid var(--danger); color:var(--danger); padding:12px; border-radius:12px; width:100%; cursor:pointer; font-size:15px;">
-          Удалить объект
-        </button>
-      </form>
-    </body></html>
-  `);
+        <form method="POST" action="/accounts/${account.id}/delete" onsubmit="return confirm('Удалить объект и все его операции? Это действие нельзя отменить.');">
+          <button type="submit" style="background:none; border:1px solid var(--danger); color:var(--danger); padding:12px; border-radius:12px; width:100%; cursor:pointer; font-size:15px;">
+            Удалить объект
+          </button>
+        </form>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка загрузки формы');
+  }
 });
 
 // ===== РЕДАКТИРОВАНИЕ ОБЪЕКТА (сохранение) =====
-app.post('/accounts/:id/edit', (req, res) => {
+app.post('/accounts/:id/edit', async (req, res) => {
   if (!req.user) return res.redirect('/');
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.user.id);
-  if (!account) return res.status(404).send('Объект не найден');
+  try {
+    const accountResult = await pool.query(
+      'SELECT * FROM accounts WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).send('Объект не найден');
 
-  const { name, type, contract_amount } = req.body;
-  if (!name || !name.trim()) return res.redirect('/accounts/' + account.id + '/edit');
+    const { name, type, contract_amount } = req.body;
+    if (!name || !name.trim()) return res.redirect('/accounts/' + account.id + '/edit');
 
-  const contract = parseFloat(contract_amount) || 0;
+    const contract = parseFloat(contract_amount) || 0;
 
-  db.prepare('UPDATE accounts SET name = ?, type = ?, contract_amount = ? WHERE id = ? AND user_id = ?')
-    .run(name.trim(), type || null, contract, account.id, req.user.id);
+    await pool.query(
+      'UPDATE accounts SET name = $1, type = $2, contract_amount = $3 WHERE id = $4 AND user_id = $5',
+      [name.trim(), type || null, contract, account.id, req.user.id]
+    );
 
-  res.redirect('/accounts/' + account.id);
+    res.redirect('/accounts/' + account.id);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка сохранения');
+  }
 });
+
 // ===== УДАЛЕНИЕ ОБЪЕКТА =====
-app.post('/accounts/:id/delete', (req, res) => {
+app.post('/accounts/:id/delete', async (req, res) => {
   if (!req.user) return res.redirect('/');
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.user.id);
-  if (!account) return res.status(404).send('Объект не найден');
+  try {
+    const accountResult = await pool.query(
+      'SELECT * FROM accounts WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).send('Объект не найден');
 
-  // Сначала удаляем все операции этого объекта, потом сам объект
-  db.prepare('DELETE FROM transactions WHERE account_id = ?').run(account.id);
-  db.prepare('DELETE FROM accounts WHERE id = ?').run(account.id);
+    await pool.query('DELETE FROM transactions WHERE account_id = $1', [account.id]);
+    await pool.query('DELETE FROM accounts WHERE id = $1', [account.id]);
 
-  res.redirect('/');
+    res.redirect('/');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка удаления');
+  }
 });
+
 // ===== ДОБАВЛЕНИЕ ОПЕРАЦИИ =====
-app.post('/accounts/:id/transactions', (req, res) => {
+app.post('/accounts/:id/transactions', async (req, res) => {
   if (!req.user) return res.redirect('/');
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.user.id);
-  if (!account) return res.status(404).send('Объект не найден');
+  try {
+    const accountResult = await pool.query(
+      'SELECT * FROM accounts WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).send('Объект не найден');
 
-  const kind = req.body.kind === 'expense' ? 'expense' : 'income';
-  const rawAmount = parseFloat(req.body.amount);
-  if (isNaN(rawAmount) || rawAmount <= 0) return res.redirect('/accounts/' + account.id);
+    const kind = req.body.kind === 'expense' ? 'expense' : 'income';
+    const rawAmount = parseFloat(req.body.amount);
+    if (isNaN(rawAmount) || rawAmount <= 0) return res.redirect('/accounts/' + account.id);
 
-  const amount = kind === 'expense' ? -rawAmount : rawAmount;
-  const category = (req.body.category || '').trim() || null;
-  const description = (req.body.description || '').trim() || null;
-  const date = req.body.date || new Date().toISOString().slice(0, 10);
+    const amount = kind === 'expense' ? -rawAmount : rawAmount;
+    const category = (req.body.category || '').trim() || null;
+    const description = (req.body.description || '').trim() || null;
+    const date = req.body.date || new Date().toISOString().slice(0, 10);
 
-  db.prepare('INSERT INTO transactions (account_id, amount, category, description, date) VALUES (?, ?, ?, ?, ?)')
-    .run(account.id, amount, category, description, date);
+    await pool.query(
+      'INSERT INTO transactions (account_id, amount, category, description, date) VALUES ($1, $2, $3, $4, $5)',
+      [account.id, amount, category, description, date]
+    );
 
-  res.redirect('/accounts/' + account.id);
+    res.redirect('/accounts/' + account.id);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка добавления');
+  }
 });
+
 // ===== УДАЛЕНИЕ ОПЕРАЦИИ =====
-app.post('/accounts/:accountId/transactions/:txId/delete', (req, res) => {
+app.post('/accounts/:accountId/transactions/:txId/delete', async (req, res) => {
   if (!req.user) return res.redirect('/');
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?')
-    .get(req.params.accountId, req.user.id);
-  if (!account) return res.status(404).send('Объект не найден');
+  try {
+    const accountResult = await pool.query(
+      'SELECT * FROM accounts WHERE id = $1 AND user_id = $2',
+      [req.params.accountId, req.user.id]
+    );
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).send('Объект не найден');
 
-  // Удаляем только если операция принадлежит этому объекту
-  db.prepare('DELETE FROM transactions WHERE id = ? AND account_id = ?')
-    .run(req.params.txId, account.id);
+    await pool.query('DELETE FROM transactions WHERE id = $1 AND account_id = $2',
+      [req.params.txId, account.id]);
 
-  res.redirect('/accounts/' + account.id);
+    res.redirect('/accounts/' + account.id);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка удаления операции');
+  }
 });
+
 // ===== СОЗДАНИЕ ОБЪЕКТА =====
-app.post('/accounts', (req, res) => {
+app.post('/accounts', async (req, res) => {
   if (!req.user) return res.redirect('/');
-  const { name, type, contract_amount } = req.body;
-  if (!name || !name.trim()) return res.redirect('/');
-  const contract = parseFloat(contract_amount) || 0;
-  db.prepare('INSERT INTO accounts (user_id, name, type, currency, contract_amount) VALUES (?, ?, ?, ?, ?)')
-    .run(req.user.id, name.trim(), type || null, 'RUB', contract);
-  res.redirect('/');
+
+  try {
+    const { name, type, contract_amount } = req.body;
+    if (!name || !name.trim()) return res.redirect('/');
+    const contract = parseFloat(contract_amount) || 0;
+
+    await pool.query(
+      'INSERT INTO accounts (user_id, name, type, currency, contract_amount) VALUES ($1, $2, $3, $4, $5)',
+      [req.user.id, name.trim(), type || null, 'RUB', contract]
+    );
+
+    res.redirect('/');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка создания объекта');
+  }
 });
 
 // ===== АВТОРИЗАЦИЯ =====
